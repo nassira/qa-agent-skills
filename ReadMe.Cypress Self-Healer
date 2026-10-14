@@ -1,0 +1,202 @@
+# Cypress Self-Healer
+
+A Claude Code agent that fixes **one** failing Cypress spec. It runs the spec in Chrome, reads the real page where the test fails, finds the cause, and proposes a small fix to a selector or a wait. It never changes what the test checks.
+
+Agent file: `.claude/agents/cypress-self-healer.md`
+Page-scan tool: `.claude/agents/tools/dom-digest.js`
+
+---
+
+## When to use it
+
+| Situation | Use |
+|---|---|
+| You know which spec is broken | **cypress-self-healer** |
+| A spec is flaky (passes one run, fails the next) | **cypress-self-healer** |
+| The frontend changed (new column, renamed button) and some tests broke | **cypress-self-healer** |
+| You want to fix what failed in last night's Jenkins run | `cypress-report-healer`, or `/cypress-nightlyreportaudit` first |
+
+The report-healer chooses which specs to fix and in which order. The self-healer does the fixing, one spec at a time.
+
+---
+
+## Before you start
+
+| You need | Why |
+|---|---|
+| Claude Code, opened in this repository | The agent lives in `.claude/agents/` |
+| Chrome installed | The spec runs headed (with the browser window open) in Chrome |
+| Access to `website` | The specs run against this environment |
+| Login data in `cypress.env.json` / `.env.test` | The specs log in before they start |
+| No other Cypress run open | Two runs at the same time fight over Chrome |
+
+---
+
+## Quick start
+
+1. Open Claude Code in this repository.
+2. Ask for the agent and name the spec:
+
+   ```
+   @cypress-self-healer heal  
+   ```
+
+3. Optional: paste the error text or the nightly report entry. This saves one run.
+4. Wait for the first result. It lists every failure, its cause, and the planned fix.
+5. Answer its questions. It asks one at a time and marks one choice as recommended.
+6. At the end, read the diff and choose: keep it or revert it.
+
+### Useful variations
+
+| You type | What happens |
+|---|---|
+| `@cypress-self-healer heal <spec>` | Heals the whole spec |
+| `@cypress-self-healer heal <spec>, only the test " "` | Focuses on that one test with a temporary `.only`, and removes it afterwards |
+| `@cypress-self-healer heal <spec>. Nightly error: <paste>` | Starts from the nightly error |
+| `@cypress-self-healer check <spec> for flakiness` | Runs it up to 3 times. It does not edit a spec that passes. |
+
+---
+
+## How it works
+
+It works the way a person would: run once, look at everything that broke, fix it all together, then run again. The target is **3 runs**.
+
+### 1. Scope and baseline
+- It reads the spec and every support command the spec calls.
+- It checks `git status` and `git log` for recent changes.
+- It reads the comments in the code. Many workarounds exist for a reason (for example, `{ force: true }` on the " " menu). It does not remove them without proof.
+
+### 2. Pass A: discovery (1 run)
+1. It runs the spec once in Chrome:
+   ```
+   npx cypress run --headed --browser chrome --spec <spec> --config video=false
+   ```
+2. It reads every failure and the failure screenshots in `cypress/screenshots`.
+3. It groups the failures by root cause. One selector used in many places counts as one fix.
+4. When the error and the screenshot do not explain a failure, it scans the **whole live page**:
+   - It puts a temporary `.only` on that test and runs it with `--no-exit`, so Chrome stays open at the failure.
+   - It runs `node .claude/agents/tools/dom-digest.js <file>`. This writes every element on the page to a file: buttons, inputs, `data-testid`s, grid rows, open popups and load panels, each marked visible, hidden, disabled or covered.
+   - It searches that file, instead of pasting the whole page into the chat.
+5. It reports a first result: each failure, its cause, and the planned fix.
+
+### 3. Pass B: batch fix
+- It applies all planned fixes together.
+- It runs the spec once more and looks only at failures that are still there or new.
+- At most 3 fix rounds.
+
+### 4. Pass C: confirm
+- One clean run with no edit in between. Green means healed.
+- A second run only if the fix was about timing, because timing fixes can pass once by luck.
+- It lints only the files it touched.
+- It shows the full diff and a table: step, old selector, new selector, evidence.
+
+---
+
+## What it fixes and what it does not
+
+It classifies every failure:
+
+| Cause | Meaning | Fixed by the agent? |
+|---|---|---|
+| `selector-changed` | The class, text or structure changed | Yes |
+| `timing/race` | The test acts before the page is ready | Yes |
+| `devextreme-behavior` | Grid re-render, popup animation, hidden checkbox input, and similar | Yes |
+| `covered/detached` | A popup or overlay covers the element, or the element was replaced | Yes |
+| `data` | Test data is missing or left over from an earlier run | No. Reported. |
+| `product-bug` | The app behaves wrongly | No. Reported, with a suggested Jira ticket. |
+| `environment` | The server was slow or down | No. Reported. |
+
+It never hides a data problem, a product bug or a slow server behind a selector change.
+
+---
+
+## Rules it always follows
+
+1. **No change to test logic.** Same steps, same order, same checks, same data. Only *how an element is found* or *how the test waits* may change.
+2. **No weaker tests.** It does not remove assertions, loosen expected values, add `try/catch`, or add more retries.
+3. **The frontend is read-only.** The one exception is adding a `data-testid` attribute.
+4. **No guessing.** Every fix is backed by something it saw: the live page, the command log, a network call, or git history.
+5. **It asks first**, one question at a time, before it:
+   - adds a `data-testid` to the frontend,
+   - adds `{ force: true }`,
+   - puts back an old solution from git history.
+6. **It follows `CLAUDE.md`:**
+   - flat `cy` steps,
+   - no loops, helpers or promise chains unless the same pattern already exists,
+   - **never `cy.wait(<milliseconds>)`** (it waits for an intercepted request, an element state, or a retryable check),
+   - it reuses existing selectors, commands, fixtures and intercepts.
+7. **It does not commit.** You decide.
+
+---
+
+## Preferred fixes, most stable first
+
+1. Add a `data-testid` (after you say yes).
+2. Use an existing `[data-testid=...]` selector or custom command.
+3. Use a stable hook: `aria-label`, `role`, `name`, `placeholder`, or exact visible text inside its container.
+4. Use a scoped CSS chain from a stable container.
+
+Never used: bare classes, `nth-child`, `eq(n)` with no reason, and generated `dx-...` ids (they change on every render).
+
+For timing it uses, in this order:
+- a named intercept on the real request, then `cy.wait("@alias")`,
+- a retryable check on the ready state,
+- a wait for the blocking popup or load panel to disappear.
+
+---
+
+## DevExtreme things it knows
+
+| Problem | What it does |
+|---|---|
+| Grid re-renders and the element is "detached" | Finds the element again right before the action, and never keeps it across a grid update |
+| Grid still loading | Waits for the grid's request and for `.dx-loadpanel` to disappear |
+| Rows not in the DOM (virtual scrolling) | Filters or scrolls first |
+| Cell editor not there yet | Clicks the cell, checks that the editor exists, then types |
+| SelectBox / DateBox list | Looks for the list in the overlay at the end of `body`, not inside the widget |
+| Checkbox | Clicks `.dx-checkbox` and checks `aria-checked`, because the real input is hidden |
+| Button disabled | Checks for `dx-state-disabled` |
+| Text shown differs by language | Checks the text actually on screen. Example: the today button is "Today" in English and "Heute" in German. |
+
+---
+
+## Limits that stop it from looping
+
+- About **15 minutes** or **3 page scans** of discovery per spec, then it reports.
+- **2 probes per failure.** If the cause is still unclear, it says what it saw and moves on.
+- **3 fix rounds** at most.
+- The **same failure twice after a fix** means the diagnosis was wrong. It stops and asks.
+- Cause is `data`, `product-bug` or `environment`: it reports and stops.
+- It stops only the processes it started. It never kills every Chrome window.
+
+---
+
+## What you get at the end
+
+- **Result:** healed, partly healed, or blocked. Also the number of runs used and the clean run result.
+- **For each fix:** the cause, the evidence, `file:line`, and the code before and after.
+- **Not fixed:** the cause, and who should act (product team, test data, environment).
+- **Notes** about problems it saw in other files. It does not edit those.
+
+---
+
+## Example
+
+```
+@cypress-self-healer heal xxxx.spec.cy.js
+```
+
+1. Run 1: 16 of 20 tests fail with "cy.type() ... element is no longer attached to the DOM".
+2. Screenshot and code: each committed cell starts a "xxxx" preview request. Its answer redraws the grid and replaces the cell editor.
+3. Fix in `xxx.action.js`: wait for `[data-testid="xxxx"]` before typing into the next cell. Find the input fresh, type, and commit.
+4. Result: 12 of 20 pass, up from 4.
+5. The remaining tests lose their typed value at random, whatever commit method is used. Reported as a likely product bug, with a suggested Jira ticket. The test was not changed further to hide it.
+
+---
+
+## Tips
+
+- **Paste the nightly error** when you start. It skips a discovery step.
+- **A spec passes for you but fails at night?** The agent runs it up to 3 times and does not edit it. The cause is most likely the nightly environment.
+- **A fix to a shared command** (for example `cy.Filter`) affects many specs. The agent proves it on one other affected spec. It does not run the whole suite.
+- **A `data-testid` in the frontend** only helps after it is deployed to the test environment. Until then, the agent offers a selector that works now.
