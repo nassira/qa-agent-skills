@@ -1,0 +1,209 @@
+# Cypress Nightly Report Audit
+
+A Claude Code skill that reads the Jenkins Cypress nightly report and finds the real problems behind the red tests. It shows them on a dashboard and fixes them one at a time, only after you say yes.
+
+Command: `/cypress-nightlyreportaudit`
+
+---
+
+## What it does
+
+Every night, Jenkins runs the Cypress suite and produces a report. Often more than 100 tests fail, but most of them share a few causes. This skill:
+
+1. Finds the newest report on your computer.
+2. Reads every failed test, with the full error message.
+3. Saves the result in a history, so it can compare nights.
+4. Sorts each failure into a group (see [Failure groups](#failure-groups)).
+5. Builds a dashboard with the pass-rate trend and a ranked list of fixes.
+6. Fixes the test code one candidate at a time, after you confirm each edit.
+
+It never edits test code on its own.
+
+---
+
+## Before you start
+
+| You need | Why |
+|---|---|
+| Claude Code, opened in this repository | The skill lives in `.claude/skills/cypress-nightlyreportaudit/` |
+| The nightly `reports.zip` from Jenkins | This is the input. Download it from the Jenkins build artifacts. |
+| Node.js | The skill parses the report with a small Node script |
+ 
+
+You do not need to unzip the report. The skill does it.
+
+---
+
+## Quick start
+
+1. Open the last Jenkins Cypress build.
+2. Download `reports.zip` into your `Downloads` folder.
+3. Open Claude Code in this repository.
+4. Type:
+
+   ```
+   /cypress-nightlyreportaudit
+   ```
+
+5. Read the short summary in the terminal and open the dashboard link.
+6. Answer the question: which fix to start with. The first one is the recommended one.
+7. For each fix, read the proposed edit, then answer "yes" or "no".
+
+### Useful variations
+
+| You type | What happens |
+|---|---|
+| `/cypress-nightlyreportaudit` | Uses the newest `reports*` file in Downloads |
+| `/cypress-nightlyreportaudit C:\path\to\reports` | Uses that report folder or zip |
+| `/cypress-nightlyreportaudit investigate spec by spec` | Investigates every failing spec on its own and writes a detailed report |
+ 
+
+---
+
+## How it works, step by step
+
+### Step 1: Find the report
+- It looks in `Downloads` for the newest `reports*` file that is not already in the history.
+- Repeated downloads are named `reports - <timestamp>.zip`. That is fine.
+- If it finds nothing, it asks you for the path.
+- Chrome results are always read. On Sundays, Firefox results are read too.
+
+### Step 2: Parse it
+- The test data is hidden inside `mochawesome.html`. A small Node script extracts it.
+- It keeps the **full** error message for every failed test. The useful detail (which selector, "covered by another element", and so on) is usually on line 2 or later.
+
+### Step 3: Save the history
+Two files are saved:
+- `.claude/cypress-audit/history/<run-date>-<browser>.json`: one file per night.
+- `.claude/cypress-audit/history/index.json`: the list of all nights read so far.
+
+The date is the date the run started, not today's date. A nightly run crosses midnight.
+
+### Step 4: Classify the failures
+Each failing test is compared with the earlier nights. See [Failure groups](#failure-groups).
+
+### Step 5: Dashboard
+- A private page with:
+  - the pass rate per night,
+  - today's numbers,
+  - the ranked fix list,
+  - the tests fixed since the last run.
+- A local copy is kept in `.claude/cypress-audit/dashboards/<run-date>-<browser>.html`.
+- Each night gets its own page. Old nights are never overwritten.
+- When you ask for a spec-by-spec investigation, the dashboard also has one section per spec. Each failed test shows its last 10 nights, its type, where it fails, and the fix direction.
+
+### Step 6: Fix, one at a time
+1. It asks which candidate to start with.
+2. It reads the real code first: the spec, the support command, and the frontend file behind the request or selector. It never guesses an endpoint or a selector.
+3. It shows the exact, small edit.
+4. It applies the edit only after your "yes".
+5. It moves to the next candidate only after your "yes".
+
+If a candidate is a real product question, it says so and suggests a Jira ticket (or `/opsx:new`) instead of a test edit.
+
+---
+
+## Failure groups
+
+| Group | Meaning | Priority |
+|---|---|---|
+| **Cross-spec cluster** | The same error in 2 or more spec files. One shared support command or selector can fix many specs at once. | Highest |
+| **Broken** | The same test fails with the same error every night on record. It is not flaky, it is unaddressed. | High |
+| **New regression** | It passed the night before and fails now. The skill lists the commits between the two runs as a lead. | High |
+| **Intermittent** | Fails some nights and passes on others. Often not worth a code change. | Low |
+| **Resolved** | Failed the night before and passes now. This proves a past fix worked. | Shown as a win |
+
+### Words you will see
+
+| Word | Meaning |
+|---|---|
+| **Cascade** | A test that fails only because an earlier test in the same spec failed. Our specs use `testIsolation: false`, so each test starts on the page the previous test left. Fix the first failure and the cascades clear by themselves. |
+| **Intercept** | Cypress watching an API call so the test can wait for it (`cy.intercept` and then `cy.wait("@alias")`). |
+| **Not reproduced locally** | The test passes on your machine. Usually the nightly environment was slow. No edit is made. |
+| **Backend / environment** | The server was slow or a job never finished. Test code cannot fix this. It is reported, not hidden. |
+| **Product change** | The app changed (a renamed button, a new column) and the test did not follow. |
+
+---
+
+## Rules it always follows
+
+These come from the repository's `CLAUDE.md`:
+
+- No edit without your confirmation.
+- Test code is written as flat `cy` steps, in the style of the file.
+- No loops, conditionals, helper functions or promise chains, unless that exact pattern is already used for the same purpose.
+- No `cy.wait(<milliseconds>)`. It waits for a request, an element state or a retryable assertion.
+- It reuses existing selectors, custom commands, fixtures and intercepts.
+- It never changes frontend behavior, styles or services to make a test pass. Only a `data-testid` may be added, and only after you say yes.
+- A real product bug or a data problem is reported, not hidden with a selector change.
+
+---
+
+## The healer agents
+
+The skill works with two agents in `.claude/agents/`.
+
+| | `cypress-report-healer` | `cypress-self-healer` |
+|---|---|---|
+| Starts from | The nightly report | One spec you name |
+| Decides what to fix | Yes. It ranks the failures and suggests an order. | No, you choose |
+| How it fixes | Uses the self-healer's method, one spec at a time | Runs the spec in Chrome, scans the live page with `tools/dom-digest.js`, and fixes the selector or the wait |
+| Use it when | You want to fix last night's failures | You already know which spec is broken |
+
+The report-healer chooses what to fix and in which order. The self-healer does the fixing.
+
+How the report-healer heals a spec:
+1. It runs the spec locally once, before any change.
+2. It compares the local result with the report.
+3. It fixes it in at most 3 runs: one to find the problem, one to check the fix, one clean run to confirm.
+4. It writes the result to `.claude/cypress-audit/heal-reports/<date>.md`.
+
+---
+
+## Files it creates
+
+```
+.claude/cypress-audit/
+├── history/
+│   ├── index.json                  list of all nights read
+│   └── <date>-chrome.json          every failed test of that night, full error
+├── dashboards/
+│   ├── index.json                  date -> dashboard link
+│   └── <date>-chrome.html          local copy of each night's dashboard
+├── investigations/
+│   └── <date>-chrome.md            spec-by-spec report (when you ask for it)
+└── heal-reports/
+    └── <date>.md                   what was fixed, how, and what to check next night
+```
+
+---
+
+## Daily routine
+
+1. **Morning, after the nightly Chrome job:** download `reports.zip` and run `/cypress-nightlyreportaudit`.
+2. Start with the first cross-spec cluster. One fix there usually clears many tests.
+3. Then fix "broken every night" and "new regression" tests.
+4. Leave "intermittent" tests for last.
+5. Commit the fixes on your branch.
+6. **Next morning:** check the "Resolved" section. A fix only counts once your branch is on `origin/develop`, because the nightly runs `develop`.
+7. **Sunday:** run it again after the weekly Firefox job.
+
+You can ask Claude Code to repeat this with `/loop` or a scheduled run if you do not want to start it by hand.
+
+---
+
+## Tips
+
+- **Many failures at once?** Look for one shared cause first. On 2026-10-13, 152 tests failed, and about 45 of them came from one slow backend request that kept the flight search "Apply" button disabled.
+- **A test fails at night but passes for you?** Run it 3 times locally. If it still passes, it is most likely the environment. Do not change the test.
+- **The same test passes one run and fails the next, whatever you change?** Stop. It is most likely the app. Open a Jira ticket with the evidence.
+- **The commit hook fails on a file you touched?** The hook lints the whole file, so old lint errors in that file also block the commit.
+
+---
+
+## Limits
+
+- It reads Jenkins reports only. It does not start Jenkins builds.
+- It never runs the whole suite. It runs one spec, or one test with a temporary `.only`, which it removes afterwards.
+- The dashboard is private to you until you share it.
+- `.claude/` is in `.gitignore`. To share the skill itself, copy `SKILL.md`, this `README.md` and the two agent files to the shared location.
